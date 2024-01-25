@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tracing::{error, instrument};
+use tracing::{error, trace, debug, info};
+use color_eyre::{eyre::{eyre, WrapErr}, Result};
 
 use serenity::all::ChannelId;
 use serenity::all::GuildId;
@@ -18,14 +19,20 @@ struct Handler {
     notify_channels: Arc<Mutex<HashMap<GuildId, ChannelId>>>,
 }
 
+macro_rules! log_err_and_return {
+    ($err_str:expr) => {
+        {
+            error!($err_str);
+            return;
+        }
+    };
+}
+
 macro_rules! reply_and_return {
     ($orig_msg:expr, $content:expr, $ctx:expr) => {{
         match $orig_msg.reply_mention(&$ctx, $content).await {
             Ok(_) => (),
-            Err(e) => {
-                error!("couldn't reply to message: {e}");
-                return;
-            }
+            Err(e) => log_err_and_return!("couldn't reply to message: {e}"),
         }
         return;
     }};
@@ -33,7 +40,7 @@ macro_rules! reply_and_return {
 
 #[async_trait]
 impl EventHandler for Handler {
-    #[instrument]
+    #[tracing::instrument]
     async fn guild_member_removal(
         &self,
         ctx: Context,
@@ -41,40 +48,40 @@ impl EventHandler for Handler {
         user: User,
         _member_data: Option<Member>,
     ) {
-        let notify_channels = self.notify_channels.lock().await;
-        let Some(notify_cid) = notify_channels.get(&guild_id) else {
-            error!("no notify channel set for {guild_id}");
-            return;
+        debug!("guild member removed");
+        let notify_cid = {
+            let notify_channels = self.notify_channels.lock().await;
+            let Some(&notify_cid) = notify_channels.get(&guild_id) else {
+                log_err_and_return!("no notify channel set for {guild_id}");
+            };
+            notify_cid
         };
         let guild_channels = match guild_id.channels(&ctx.http).await {
             Ok(c) => c,
-            Err(e) => {
-                error!("error getting channels for {guild_id}: {e}");
-                return;
-            }
+            Err(e) => log_err_and_return!("error getting channels for {guild_id}: {e}"),
         };
         let to_notif = guild_channels
-            .get(notify_cid)
-            .ok_or_else(|| format!("guild {guild_id} doesn't have a channel {notify_cid}"))
+            .get(&notify_cid)
+            .ok_or_else(|| eyre!("guild {guild_id} doesn't have a channel {notify_cid}"))
             .unwrap();
 
         let content = format!("{} ({}) has left the server", user.name, user.id);
         match to_notif.say(ctx, content).await {
-            Ok(_) => (),
-            Err(e) => {
-                error!("couldn't send message to channel {notify_cid} in guild {guild_id}: {e}")
-            }
+            Ok(_) => debug!("leaving message sent to {guild_id}"),
+            Err(e) => log_err_and_return!("couldn't send message to channel {notify_cid} in guild {guild_id}: {e}"),
         }
     }
 
-    #[instrument]
+    #[tracing::instrument]
     async fn message(&self, ctx: Context, new_message: Message) {
         let Some(content) = new_message.content.strip_prefix(COMMAND_PREFIX) else {
+            trace!("non-command message: {}", new_message.content);
             return;
         };
 
         let Some(cid_lit) = content.strip_prefix("notifchan ") else {
-            reply_and_return!(new_message, "bad command", ctx);
+            let reply = format!("bad command format, use: `{COMMAND_PREFIX} notifchan <channelid>`");
+            reply_and_return!(new_message, reply, ctx);
         };
 
         const CID_INVALID: &str = "channel id invalid";
@@ -97,17 +104,7 @@ impl EventHandler for Handler {
             Ok(_) => (),
             Err(e) => {
                 error!("couldn't send message to channel {cid}: {e}");
-                match new_message
-                    .reply_mention(&ctx, "I can't find or don't have access to that channel")
-                    .await
-                {
-                    Ok(_) => (),
-                    Err(e) => {
-                        error!("couldn't send message in reply: {e}");
-                        return;
-                    }
-                }
-                return;
+                reply_and_return!(new_message, "I can't find or don't have access to that channel", ctx);
             }
         }
 
@@ -119,23 +116,24 @@ impl EventHandler for Handler {
 }
 
 #[tokio::main]
-#[instrument]
-async fn main() {
+#[tracing::instrument]
+async fn main() -> Result<()> {
+    color_eyre::install().expect("couldn't initialise eyre");
+    tracing_subscriber::fmt::init();
+
     let token = std::env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN not set");
-    let intents = GatewayIntents::GUILD_MEMBERS | GatewayIntents::GUILD_MESSAGES;
+    let intents = GatewayIntents::GUILD_MEMBERS | GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
 
     let handler = Handler {
         notify_channels: Arc::new(Mutex::new(HashMap::new())),
     };
 
+    info!("starting client");
     let mut client = Client::builder(&token, intents)
         .event_handler(handler)
         .await
-        .expect("error creating client");
+        .wrap_err("error creating client")?;
 
-    if let Err(e) = client.start().await {
-        error!("client error: {e}");
-    }
-
+    client.start().await.wrap_err("client start error")?;
     unreachable!("client exited")
 }
