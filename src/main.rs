@@ -19,18 +19,16 @@ struct Handler {
 }
 
 macro_rules! reply_and_return {
-    ($orig_msg:expr, $content:expr, $ctx:expr) => {
-        {
-            match $orig_msg.reply_mention(&$ctx, $content).await {
-                Ok(_) => (),
-                Err(e) => {
-                    error!("couldn't reply to message: {e}");
-                    return;
-                }
+    ($orig_msg:expr, $content:expr, $ctx:expr) => {{
+        match $orig_msg.reply_mention(&$ctx, $content).await {
+            Ok(_) => (),
+            Err(e) => {
+                error!("couldn't reply to message: {e}");
+                return;
             }
-            return;
         }
-    };
+        return;
+    }};
 }
 
 #[async_trait]
@@ -89,11 +87,20 @@ impl EventHandler for Handler {
         };
         let cid = ChannelId::new(cid_lit);
 
-        match cid.say(&ctx, "This is now the channel that will be notified when someone leaves.").await {
+        match cid
+            .say(
+                &ctx,
+                "This is now the channel that will be notified when someone leaves.",
+            )
+            .await
+        {
             Ok(_) => (),
             Err(e) => {
                 error!("couldn't send message to channel {cid}: {e}");
-                match new_message.reply_mention(&ctx, "I can't find or don't have access to that channel").await {
+                match new_message
+                    .reply_mention(&ctx, "I can't find or don't have access to that channel")
+                    .await
+                {
                     Ok(_) => (),
                     Err(e) => {
                         error!("couldn't send message in reply: {e}");
@@ -104,7 +111,9 @@ impl EventHandler for Handler {
             }
         }
 
-        let gid = new_message.guild_id.expect("no guild id attached to message");
+        let gid = new_message
+            .guild_id
+            .expect("no guild id attached to message");
         self.notify_channels.lock().await.insert(gid, cid);
     }
 }
@@ -112,8 +121,8 @@ impl EventHandler for Handler {
 #[tokio::main]
 #[instrument]
 async fn main() {
-    let token = std::env::var("DISCORD_TOKEN").expect("DISCORD TOKEN not set");
-    let intents = GatewayIntents::GUILD_MEMBERS;
+    let token = std::env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN not set");
+    let intents = GatewayIntents::GUILD_MEMBERS | GatewayIntents::GUILD_MESSAGES;
 
     let handler = Handler {
         notify_channels: Arc::new(Mutex::new(HashMap::new())),
@@ -127,4 +136,6 @@ async fn main() {
     if let Err(e) = client.start().await {
         error!("client error: {e}");
     }
+
+    unreachable!("client exited")
 }
