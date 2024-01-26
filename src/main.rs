@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 
 use color_eyre::{
     eyre::{eyre, WrapErr},
@@ -22,9 +21,30 @@ struct Handler {
 }
 
 impl Handler {
+    #[tracing::instrument]
+    async fn new(filename: &Path) -> Result<Self> {
+        let options = sqlite::SqliteConnectOptions::new()
+            .create_if_missing(true)
+            .filename(filename);
+
+        debug!("attempting to open database connection to '{:?}'", filename);
+        let db_pool = sqlite::SqlitePoolOptions::new()
+            .connect_with(options)
+            .await
+            .wrap_err("failed connecting to sqlite database")?;
+
+        info!("running database migrations");
+        sqlx::migrate!()
+            .run(&db_pool)
+            .await
+            .wrap_err("failed running database migrations")?;
+
+        Ok(Self { db_pool })
+    }
+
     async fn get_notify_channel(&self, guild_id: &GuildId) -> Result<ChannelId> {
         let query = sqlx::query("SELECT channel_id FROM notify_channel WHERE guild_id = ?")
-            .bind(format!("{}", guild_id.get()))
+            .bind(bytemuck::cast::<_, i64>(guild_id.get()))
             .fetch_one(&self.db_pool)
             .await
             .wrap_err("failed to get notify channel from db")?;
@@ -38,13 +58,13 @@ impl Handler {
     async fn set_notify_channel(&self, guild_id: &GuildId, channel_id: &ChannelId) -> Result<()> {
         // TODO: transaction??
         sqlx::query("DELETE FROM notify_channel WHERE guild_id = ?")
-            .bind(format!("{}", guild_id.get()))
+            .bind(bytemuck::cast::<_, i64>( guild_id.get()))
             .execute(&self.db_pool)
             .await
             .wrap_err("failed to clear old notify channel")?;
         sqlx::query("INSERT INTO notify_channel (guild_id, channel_id) VALUES(?, ?)")
-            .bind(format!("{}", guild_id.get()))
-            .bind(format!("{}", channel_id.get()))
+            .bind(bytemuck::cast::<_, i64>(guild_id.get()))
+            .bind(bytemuck::cast::<_, i64>(channel_id.get()))
             .execute(&self.db_pool)
             .await
             .wrap_err("failed to insert notify channel")?;
@@ -76,16 +96,6 @@ impl Handler {
 macro_rules! log_err_and_return {
     ($err_str:expr) => {{
         error!($err_str);
-        return;
-    }};
-}
-
-macro_rules! reply_and_return {
-    ($orig_msg:expr, $content:expr, $ctx:expr) => {{
-        match $orig_msg.reply_mention(&$ctx, $content).await {
-            Ok(_) => (),
-            Err(e) => log_err_and_return!("couldn't reply to message: {e}"),
-        }
         return;
     }};
 }
@@ -126,6 +136,7 @@ impl EventHandler for Handler {
         }
     }
 
+    // TODO: Access control
     #[tracing::instrument]
     async fn message(&self, ctx: Context, new_message: Message) {
         let cid = match Self::parse_set_channel(&new_message.content) {
@@ -133,43 +144,37 @@ impl EventHandler for Handler {
             Ok(None) => return,
             Err(e) => match new_message.reply_mention(&ctx, e).await {
                 Ok(_) => return,
-                Err(e) => log_err_and_return!("{e}"),
+                Err(e) => log_err_and_return!("failed to send command usage message: {e}"),
             },
         };
 
-        match cid
-            .say(
-                &ctx,
-                "This is now the channel that will be notified when someone leaves.",
-            )
-            .await
-        {
-            Ok(_) => (),
-            Err(e) => {
-                error!("couldn't send message to channel {cid}: {e}");
-                reply_and_return!(
-                    new_message,
-                    "I can't find or don't have access to that channel",
-                    ctx
-                );
+        debug!("request to change notification channel received");
+        const CONFIRM_MSG: &str = "This channel will be notified when someone leaves.";
+        let confirmation = cid.say(&ctx, CONFIRM_MSG).await;
+        if let Err(e) = confirmation {
+            error!("couldn't send message to channel {cid}: {e}");
+            let content = "I can't find or don't have access to that channel";
+            if let Err(e) = new_message.reply_mention(&ctx, content).await {
+                error!("couldn't reply to message: {e}");
             }
+            return;
         }
 
         let gid = new_message
             .guild_id
             .expect("no guild id attached to message");
 
-        match self.set_notify_channel(&gid, &cid).await {
-            Ok(_) => (),
-            Err(e) => log_err_and_return!("{e}"),
-        }
+        debug!("changing notification channel in database");
+        self.set_notify_channel(&gid, &cid)
+            .await
+            .unwrap_or_else(|e| log_err_and_return!("{e}"));
     }
 }
 
 #[derive(serde::Deserialize)]
 struct Options {
     discord_token: String,
-    db_path: String,
+    db_path: PathBuf,
 }
 
 impl Options {
@@ -183,32 +188,6 @@ impl Options {
     }
 }
 
-#[tracing::instrument]
-async fn db_init(filename: &str) -> Result<sqlite::SqlitePool> {
-    let options = sqlite::SqliteConnectOptions::new()
-        .create_if_missing(true)
-        .filename(filename);
-
-    debug!("attempting to open database connection to '{}'", filename);
-    let db = sqlite::SqlitePoolOptions::new()
-        .connect_with(options)
-        .await
-        .wrap_err("failed connecting to sqlite database")?;
-
-    info!("running database migrations");
-    sqlx::migrate!()
-        .run(
-            &mut db
-                .acquire()
-                .await
-                .wrap_err("failed to acquire db connection from pool")?,
-        )
-        .await
-        .wrap_err("failed running database migrations")?;
-
-    Ok(db)
-}
-
 #[tokio::main]
 #[tracing::instrument]
 async fn main() -> Result<()> {
@@ -216,14 +195,11 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let options = Options::get().wrap_err("failed to get configuration")?;
-    let db_pool = db_init(&options.db_path).await?;
     let intents = GatewayIntents::GUILD_MEMBERS
         | GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
 
-    let handler = Handler {
-        db_pool,
-    };
+    let handler = Handler::new(&options.db_path).await?;
 
     info!("starting client");
     let mut client = Client::builder(&options.discord_token, intents)

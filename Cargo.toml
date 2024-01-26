@@ -6,6 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+bytemuck = "1.14.1"
 color-eyre = "0.6.2"
 config = { version = "0.13.4", default-features = false, features = ["toml"] }
 serde = { version = "1.0.195", features = ["derive"] }
